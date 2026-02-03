@@ -9,7 +9,7 @@ pub mod agents;
 
 pub use agents::{
     amp as convert_amp, claude as convert_claude, codex as convert_codex,
-    opencode as convert_opencode,
+    copilot as convert_copilot, opencode as convert_opencode,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]

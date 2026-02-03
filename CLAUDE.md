@@ -9,13 +9,14 @@ There are two ways to work with the SDKs:
 
 ## Agent Schemas
 
-Agent schemas (Claude Code, Codex, OpenCode, Amp) are available for reference in `resources/agent-schemas/artifacts/json-schema/`.
+Agent schemas (Claude Code, Codex, OpenCode, Amp, Copilot) are available for reference in `resources/agent-schemas/artifacts/json-schema/`.
 
 Extraction methods:
 - **Claude**: Uses `claude --output-format json --json-schema` CLI command
 - **Codex**: Uses `codex app-server generate-json-schema` CLI command
 - **OpenCode**: Fetches from GitHub OpenAPI spec
 - **Amp**: Scrapes from `https://ampcode.com/manual/appendix?preview#message-schema`
+- **Copilot**: Copies from `~/.copilot/pkg/universal/*/schemas/session-events.schema.json`
 
 All extractors have fallback schemas for when CLI/URL is unavailable.
 

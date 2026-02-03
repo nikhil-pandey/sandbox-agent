@@ -112,6 +112,7 @@ const ChatPanel = ({
     codex: "Codex",
     opencode: "OpenCode",
     amp: "Amp",
+    copilot: "Copilot CLI",
     mock: "Mock"
   };
 

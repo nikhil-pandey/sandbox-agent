@@ -4,14 +4,14 @@ Source of truth: generated agent schemas in `resources/agent-schemas/artifacts/j
 
 Identifiers
 
-+----------------------+------------------------+------------------------------------------+-----------------------------+------------------------+
-| Universal term       | Claude                 | Codex (app-server)                       | OpenCode                    | Amp                    |
-+----------------------+------------------------+------------------------------------------+-----------------------------+------------------------+
-| session_id           | n/a (daemon-only)      | n/a (daemon-only)                        | n/a (daemon-only)           | n/a (daemon-only)      |
-| native_session_id    | none                   | threadId                                 | sessionID                   | none                   |
-| item_id              | synthetic              | ThreadItem.id                            | Message.id                  | StreamJSONMessage.id   |
-| native_item_id       | none                   | ThreadItem.id                            | Message.id                  | StreamJSONMessage.id   |
-+----------------------+------------------------+------------------------------------------+-----------------------------+------------------------+
++----------------------+------------------------+------------------------------------------+-----------------------------+------------------------+------------------------+
+| Universal term       | Claude                 | Codex (app-server)                       | OpenCode                    | Amp                    | Copilot                |
++----------------------+------------------------+------------------------------------------+-----------------------------+------------------------+------------------------+
+| session_id           | n/a (daemon-only)      | n/a (daemon-only)                        | n/a (daemon-only)           | n/a (daemon-only)      | n/a (daemon-only)      |
+| native_session_id    | none                   | threadId                                 | sessionID                   | none                   | data.sessionId         |
+| item_id              | synthetic              | ThreadItem.id                            | Message.id                  | StreamJSONMessage.id   | data.messageId         |
+| native_item_id       | none                   | ThreadItem.id                            | Message.id                  | StreamJSONMessage.id   | data.messageId         |
++----------------------+------------------------+------------------------------------------+-----------------------------+------------------------+------------------------+
 
 Notes:
 - When a provider does not supply IDs (Claude), we synthesize item_id values and keep native_item_id null.
@@ -24,22 +24,22 @@ Notes:
 
 Events / Message Flow
 
-+------------------------+------------------------------+--------------------------------------------+-----------------------------------------+----------------------------------+
-| Universal term         | Claude                       | Codex (app-server)                         | OpenCode                                | Amp                              |
-+------------------------+------------------------------+--------------------------------------------+-----------------------------------------+----------------------------------+
-| session.started        | none                         | method=thread/started                      | type=session.created                    | none                             |
-| session.ended          | SDKMessage.type=result       | no explicit session end (turn/completed)   | no explicit session end (session.deleted)| type=done                        |
-| message (user)         | SDKMessage.type=user         | item/completed (ThreadItem.type=userMessage)| message.updated (Message.role=user)    | type=message                     |
-| message (assistant)    | SDKMessage.type=assistant    | item/completed (ThreadItem.type=agentMessage)| message.updated (Message.role=assistant)| type=message                  |
-| message.delta          | stream_event (partial) or synthetic | method=item/agentMessage/delta      | type=message.part.updated (delta)       | synthetic                        |
-| tool call              | type=tool_use               | method=item/mcpToolCall/progress           | message.part.updated (part.type=tool)   | type=tool_call                   |
-| tool result            | user.message.content.tool_result | item/completed (tool result ThreadItem variants) | message.part.updated (part.type=tool, state=completed) | type=tool_result     |
-| permission.requested   | control_request.can_use_tool | none                                      | type=permission.asked                   | none                             |
-| permission.resolved    | daemon reply to can_use_tool | none                                      | type=permission.replied                 | none                             |
-| question.requested     | tool_use (AskUserQuestion)  | experimental request_user_input (payload) | type=question.asked                     | none                             |
-| question.resolved      | tool_result (AskUserQuestion) | experimental request_user_input (payload) | type=question.replied / question.rejected | none                          |
-| error                  | SDKResultMessage.error       | method=error                               | type=session.error (or message error)   | type=error                        |
-+------------------------+------------------------------+--------------------------------------------+-----------------------------------------+----------------------------------+
++------------------------+------------------------------+--------------------------------------------+-----------------------------------------+----------------------------------+------------------------------------------+
+| Universal term         | Claude                       | Codex (app-server)                         | OpenCode                                | Amp                              | Copilot                                  |
++------------------------+------------------------------+--------------------------------------------+-----------------------------------------+----------------------------------+------------------------------------------+
+| session.started        | none                         | method=thread/started                      | type=session.created                    | none                             | type=session.start                       |
+| session.ended          | SDKMessage.type=result       | no explicit session end (turn/completed)   | no explicit session end (session.deleted)| type=done                        | type=session.idle (implicit)             |
+| message (user)         | SDKMessage.type=user         | item/completed (ThreadItem.type=userMessage)| message.updated (Message.role=user)    | type=message                     | type=user.message                        |
+| message (assistant)    | SDKMessage.type=assistant    | item/completed (ThreadItem.type=agentMessage)| message.updated (Message.role=assistant)| type=message                  | type=assistant.message                   |
+| message.delta          | stream_event (partial) or synthetic | method=item/agentMessage/delta      | type=message.part.updated (delta)       | synthetic                        | type=assistant.message_delta             |
+| tool call              | type=tool_use               | method=item/mcpToolCall/progress           | message.part.updated (part.type=tool)   | type=tool_call                   | type=tool.execution_start                |
+| tool result            | user.message.content.tool_result | item/completed (tool result ThreadItem variants) | message.part.updated (part.type=tool, state=completed) | type=tool_result     | type=tool.execution_complete             |
+| permission.requested   | control_request.can_use_tool | none                                      | type=permission.asked                   | none                             | JSON-RPC callback                        |
+| permission.resolved    | daemon reply to can_use_tool | none                                      | type=permission.replied                 | none                             | JSON-RPC callback response               |
+| question.requested     | tool_use (AskUserQuestion)  | experimental request_user_input (payload) | type=question.asked                     | none                             | ask_user tool call                       |
+| question.resolved      | tool_result (AskUserQuestion) | experimental request_user_input (payload) | type=question.replied / question.rejected | none                          | ask_user tool result                     |
+| error                  | SDKResultMessage.error       | method=error                               | type=session.error (or message error)   | type=error                        | type=session.error                       |
++------------------------+------------------------------+--------------------------------------------+-----------------------------------------+----------------------------------+------------------------------------------+
 
 Synthetics
 
@@ -64,6 +64,7 @@ Delta handling
 - Codex emits agent message and other deltas (e.g., item/agentMessage/delta).
 - OpenCode emits part deltas via message.part.updated with a delta string.
 - Claude can emit stream_event deltas when partial streaming is enabled; Amp does not emit deltas.
+- Copilot emits assistant.message_delta and assistant.reasoning_delta events natively.
 
 Policy:
 - Always emit item.delta across all providers.

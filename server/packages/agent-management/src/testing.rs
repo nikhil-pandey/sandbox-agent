@@ -137,6 +137,11 @@ pub fn test_agents_from_env() -> Result<Vec<TestAgentConfig>, TestAgentConfigErr
                 }
                 credentials_with(anthropic_cred.clone(), openai_cred.clone())
             }
+            AgentId::Copilot => {
+                // Copilot uses GitHub authentication (GITHUB_TOKEN, GH_TOKEN, or gh CLI OAuth)
+                // For testing, we accept any available credentials since Copilot is multi-provider
+                credentials_with(anthropic_cred.clone(), openai_cred.clone())
+            }
             AgentId::Mock => credentials_with(None, None),
         };
         configs.push(TestAgentConfig { agent, credentials });

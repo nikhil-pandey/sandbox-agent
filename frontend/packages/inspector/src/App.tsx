@@ -19,7 +19,7 @@ import type { RequestLog } from "./types/requestLog";
 import { buildCurl } from "./utils/http";
 
 const logoUrl = `${import.meta.env.BASE_URL}logos/sandboxagent.svg`;
-const defaultAgents = ["claude", "codex", "opencode", "amp", "mock"];
+const defaultAgents = ["claude", "codex", "opencode", "amp", "copilot", "mock"];
 
 type ItemEventData = {
   item: UniversalItem;
@@ -841,6 +841,7 @@ export default function App() {
     codex: "Codex",
     opencode: "OpenCode",
     amp: "Amp",
+    copilot: "Copilot CLI",
     mock: "Mock"
   };
   const agentLabel = agentDisplayNames[agentId] ?? agentId;

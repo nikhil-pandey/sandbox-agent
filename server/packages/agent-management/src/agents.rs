@@ -21,6 +21,7 @@ pub enum AgentId {
     Codex,
     Opencode,
     Amp,
+    Copilot,
     Mock,
 }
 
@@ -31,6 +32,7 @@ impl AgentId {
             AgentId::Codex => "codex",
             AgentId::Opencode => "opencode",
             AgentId::Amp => "amp",
+            AgentId::Copilot => "copilot",
             AgentId::Mock => "mock",
         }
     }
@@ -41,6 +43,7 @@ impl AgentId {
             AgentId::Codex => "codex",
             AgentId::Opencode => "opencode",
             AgentId::Amp => "amp",
+            AgentId::Copilot => "copilot",
             AgentId::Mock => "mock",
         }
     }
@@ -51,6 +54,7 @@ impl AgentId {
             "codex" => Some(AgentId::Codex),
             "opencode" => Some(AgentId::Opencode),
             "amp" => Some(AgentId::Amp),
+            "copilot" => Some(AgentId::Copilot),
             "mock" => Some(AgentId::Mock),
             _ => None,
         }
@@ -151,6 +155,13 @@ impl AgentManager {
                 install_opencode(&install_path, self.platform, options.version.as_deref())?
             }
             AgentId::Amp => install_amp(&install_path, self.platform, options.version.as_deref())?,
+            AgentId::Copilot => {
+                // Copilot CLI is typically already installed (it's often the CLI we're running in)
+                // Just verify it exists in PATH, no download needed
+                if find_in_path("copilot").is_none() {
+                    return Err(AgentError::BinaryNotFound { agent });
+                }
+            }
             AgentId::Mock => {
                 if !install_path.exists() {
                     fs::write(&install_path, b"mock")?;
@@ -284,6 +295,29 @@ impl AgentManager {
                     events,
                 });
             }
+            AgentId::Copilot => {
+                // Copilot uses server mode with JSON-RPC over stdio
+                // For non-streaming spawns, use -p (prompt) mode with --allow-all
+                command.arg("-p").arg(&options.prompt);
+                command.arg("--allow-all"); // Auto-approve all permissions
+                command.arg("-s"); // Silent mode for scripting
+                if let Some(model) = options.model.as_deref() {
+                    command.arg("--model").arg(model);
+                }
+                if let Some(session_id) = options.session_id.as_deref() {
+                    command.arg("--resume").arg(session_id);
+                }
+                match options.permission_mode.as_deref() {
+                    Some("plan") => {
+                        // Plan mode is read-only exploration
+                        // Note: Copilot doesn't have a direct plan mode flag, handled via prompt
+                    }
+                    Some("bypass") | Some("yolo") => {
+                        command.arg("--allow-all");
+                    }
+                    _ => {}
+                }
+            }
             AgentId::Mock => {
                 return Err(AgentError::UnsupportedAgent {
                     agent: agent.as_str().to_string(),
@@ -319,11 +353,16 @@ impl AgentManager {
         } else {
             None
         };
-        if agent == AgentId::Claude {
+        let copilot_options = if agent == AgentId::Copilot {
+            Some(options.clone())
+        } else {
+            None
+        };
+        if matches!(agent, AgentId::Claude | AgentId::Copilot) {
             options.streaming_input = true;
         }
         let mut command = self.build_command(agent, &options)?;
-        if matches!(agent, AgentId::Codex | AgentId::Claude) {
+        if matches!(agent, AgentId::Codex | AgentId::Claude | AgentId::Copilot) {
             command.stdin(Stdio::piped());
         }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -337,6 +376,7 @@ impl AgentManager {
             stdout,
             stderr,
             codex_options,
+            copilot_options,
         })
     }
 
@@ -619,6 +659,27 @@ impl AgentManager {
             AgentId::Amp => {
                 return Ok(build_amp_command(&path, &working_dir, options));
             }
+            AgentId::Copilot => {
+                // Copilot uses server mode with JSON-RPC over stdio for streaming
+                if options.streaming_input {
+                    command.arg("--server").arg("--stdio");
+                    command.arg("--log-level").arg("debug");
+                } else {
+                    // Non-streaming: use -p (prompt) mode
+                    command.arg("-p").arg(&options.prompt);
+                    command.arg("--allow-all");
+                    command.arg("-s"); // Silent mode
+                }
+                if let Some(model) = options.model.as_deref() {
+                    command.arg("--model").arg(model);
+                }
+                if let Some(session_id) = options.session_id.as_deref() {
+                    command.arg("--resume").arg(session_id);
+                }
+                if let Some(agent_mode) = options.agent_mode.as_deref() {
+                    command.arg("--agent").arg(agent_mode);
+                }
+            }
             AgentId::Mock => {
                 return Err(AgentError::UnsupportedAgent {
                     agent: agent.as_str().to_string(),
@@ -717,6 +778,7 @@ pub struct StreamingSpawn {
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
     pub codex_options: Option<SpawnOptions>,
+    pub copilot_options: Option<SpawnOptions>,
 }
 
 #[derive(Debug, Error)]
@@ -940,6 +1002,18 @@ fn extract_session_id(agent: AgentId, events: &[Value]) -> Option<String> {
                     return Some(id);
                 }
             }
+            AgentId::Copilot => {
+                // Copilot session ID is in session.start event data
+                if event.get("type").and_then(Value::as_str) == Some("session.start") {
+                    if let Some(id) = event
+                        .get("data")
+                        .and_then(|d| d.get("sessionId"))
+                        .and_then(Value::as_str)
+                    {
+                        return Some(id.to_string());
+                    }
+                }
+            }
             AgentId::Mock => {}
         }
     }
@@ -1021,6 +1095,24 @@ fn extract_result_text(agent: AgentId, events: &[Value]) -> Option<String> {
             } else {
                 Some(buffer)
             }
+        }
+        AgentId::Copilot => {
+            // Extract last assistant.message content from Copilot events
+            let mut last = None;
+            for event in events {
+                if event.get("type").and_then(Value::as_str) == Some("assistant.message") {
+                    if let Some(content) = event
+                        .get("data")
+                        .and_then(|d| d.get("content"))
+                        .and_then(Value::as_str)
+                    {
+                        if !content.is_empty() {
+                            last = Some(content.to_string());
+                        }
+                    }
+                }
+            }
+            last
         }
         AgentId::Mock => None,
     }

@@ -4,18 +4,20 @@ import { extractOpenCodeSchema } from "./opencode.js";
 import { extractClaudeSchema } from "./claude.js";
 import { extractCodexSchema } from "./codex.js";
 import { extractAmpSchema } from "./amp.js";
+import { extractCopilotSchema } from "./copilot.js";
 import { validateSchema, type NormalizedSchema } from "./normalize.js";
 
 const RESOURCE_DIR = join(import.meta.dirname, "..");
 const DIST_DIR = join(RESOURCE_DIR, "artifacts", "json-schema");
 
-type AgentName = "opencode" | "claude" | "codex" | "amp";
+type AgentName = "opencode" | "claude" | "codex" | "amp" | "copilot";
 
 const EXTRACTORS: Record<AgentName, () => Promise<NormalizedSchema>> = {
   opencode: extractOpenCodeSchema,
   claude: extractClaudeSchema,
   codex: extractCodexSchema,
   amp: extractAmpSchema,
+  copilot: extractCopilotSchema,
 };
 
 function parseArgs(): { agents: AgentName[] } {

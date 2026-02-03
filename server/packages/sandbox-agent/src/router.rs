@@ -20,9 +20,9 @@ use futures::{stream, StreamExt};
 use reqwest::Client;
 use sandbox_agent_error::{AgentError, ErrorType, ProblemDetails, SandboxError};
 use sandbox_agent_universal_agent_schema::{
-    codex as codex_schema, convert_amp, convert_claude, convert_codex, convert_opencode,
-    AgentUnparsedData, ContentPart, ErrorData, EventConversion, EventSource, FileAction,
-    ItemDeltaData, ItemEventData, ItemKind, ItemRole, ItemStatus, PermissionEventData,
+    codex as codex_schema, convert_amp, convert_claude, convert_codex, convert_copilot,
+    convert_opencode, AgentUnparsedData, ContentPart, ErrorData, EventConversion, EventSource,
+    FileAction, ItemDeltaData, ItemEventData, ItemKind, ItemRole, ItemStatus, PermissionEventData,
     PermissionStatus, QuestionEventData, QuestionStatus, ReasoningVisibility, SessionEndReason,
     SessionEndedData, SessionStartedData, StderrOutput, TerminatedBy, UniversalEvent,
     UniversalEventData, UniversalEventType, UniversalItem,
@@ -272,6 +272,7 @@ struct SessionState {
     opencode_stream_started: bool,
     codex_sender: Option<mpsc::UnboundedSender<String>>,
     claude_sender: Option<mpsc::UnboundedSender<String>>,
+    copilot_sender: Option<mpsc::UnboundedSender<String>>,
     session_started_emitted: bool,
     last_claude_message_id: Option<String>,
     claude_message_counter: u64,
@@ -330,6 +331,7 @@ impl SessionState {
             opencode_stream_started: false,
             codex_sender: None,
             claude_sender: None,
+            copilot_sender: None,
             session_started_emitted: false,
             last_claude_message_id: None,
             claude_message_counter: 0,
@@ -397,6 +399,15 @@ impl SessionState {
     #[allow(dead_code)]
     fn claude_sender(&self) -> Option<mpsc::UnboundedSender<String>> {
         self.claude_sender.clone()
+    }
+
+    fn set_copilot_sender(&mut self, sender: Option<mpsc::UnboundedSender<String>>) {
+        self.copilot_sender = sender;
+    }
+
+    #[allow(dead_code)]
+    fn copilot_sender(&self) -> Option<mpsc::UnboundedSender<String>> {
+        self.copilot_sender.clone()
     }
 
     fn normalize_conversion(&mut self, mut conversion: EventConversion) -> Vec<EventConversion> {
@@ -1641,6 +1652,29 @@ impl SessionManager {
             }
             return Ok(());
         }
+        if session_snapshot.agent == AgentId::Copilot {
+            // Check if we have an existing Copilot session to send follow-up to
+            let sender = {
+                let sessions = self.sessions.lock().await;
+                if let Some(session) = Self::session_ref(&sessions, &session_id) {
+                    session.copilot_sender()
+                } else {
+                    None
+                }
+            };
+            if let Some(sender) = sender {
+                // Send follow-up message to existing Copilot session
+                self.send_copilot_turn(&session_snapshot, &message, sender)
+                    .await?;
+                if !agent_supports_item_started(session_snapshot.agent) {
+                    let _ = self
+                        .emit_synthetic_assistant_start(&session_snapshot.session_id)
+                        .await;
+                }
+                return Ok(());
+            }
+            // Otherwise fall through to spawn new process (first message)
+        }
 
         // Reopen the session if it was ended (for resumable agents)
         self.reopen_session_if_ended(&session_id).await;
@@ -2272,19 +2306,30 @@ impl SessionManager {
             stdout,
             stderr,
             codex_options,
+            copilot_options,
         } = spawn;
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let mut codex_state = codex_options
             .filter(|_| agent == AgentId::Codex)
             .map(CodexAppServerState::new);
+        let mut copilot_state = copilot_options
+            .filter(|_| agent == AgentId::Copilot)
+            .map(CopilotServerState::new);
         let mut codex_sender: Option<mpsc::UnboundedSender<String>> = None;
         let mut terminate_early = false;
 
         if let Some(stdout) = stdout {
             let tx_stdout = tx.clone();
-            tokio::task::spawn_blocking(move || {
-                read_lines(stdout, tx_stdout);
-            });
+            if agent == AgentId::Copilot {
+                // Copilot uses LSP-style Content-Length framing
+                tokio::task::spawn_blocking(move || {
+                    read_jsonrpc_messages(stdout, tx_stdout);
+                });
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    read_lines(stdout, tx_stdout);
+                });
+            }
         }
         if let Some(stderr) = stderr {
             let tx_stderr = tx.clone();
@@ -2327,6 +2372,23 @@ impl SessionManager {
                     write_lines(stdin, writer_rx);
                 });
             }
+        } else if agent == AgentId::Copilot {
+            if let Some(stdin) = stdin {
+                let (writer_tx, writer_rx) = mpsc::unbounded_channel::<String>();
+                {
+                    let mut sessions = self.sessions.lock().await;
+                    if let Some(session) = Self::session_mut(&mut sessions, &session_id) {
+                        session.set_copilot_sender(Some(writer_tx.clone()));
+                    }
+                }
+                if let Some(state) = copilot_state.as_mut() {
+                    state.start(&writer_tx);
+                }
+                tokio::task::spawn_blocking(move || {
+                    // Copilot uses LSP-style Content-Length framing
+                    write_jsonrpc_messages(stdin, writer_rx);
+                });
+            }
         }
 
         while let Some(line) = rx.recv().await {
@@ -2356,6 +2418,19 @@ impl SessionManager {
                 if !conversions.is_empty() {
                     let _ = self.record_conversions(&session_id, conversions).await;
                 }
+            } else if agent == AgentId::Copilot {
+                if let Some(state) = copilot_state.as_mut() {
+                    let outcome = state.handle_line(&line);
+                    if !outcome.conversions.is_empty() {
+                        let _ = self
+                            .record_conversions(&session_id, outcome.conversions)
+                            .await;
+                    }
+                    if outcome.should_terminate {
+                        terminate_early = true;
+                        break;
+                    }
+                }
             } else {
                 let conversions = parse_agent_line(agent, &line, &session_id);
                 if !conversions.is_empty() {
@@ -2373,6 +2448,11 @@ impl SessionManager {
             let mut sessions = self.sessions.lock().await;
             if let Some(session) = Self::session_mut(&mut sessions, &session_id) {
                 session.set_claude_sender(None);
+            }
+        } else if agent == AgentId::Copilot {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = Self::session_mut(&mut sessions, &session_id) {
+                session.set_copilot_sender(None);
             }
         }
 
@@ -3047,6 +3127,45 @@ impl SessionManager {
             .ok_or_else(|| SandboxError::StreamError {
                 message: "failed to send turn/start request".to_string(),
             })?;
+
+        Ok(())
+    }
+
+    /// Sends a session.send message to an existing Copilot session for follow-up turns.
+    async fn send_copilot_turn(
+        &self,
+        session: &SessionSnapshot,
+        prompt: &str,
+        sender: mpsc::UnboundedSender<String>,
+    ) -> Result<(), SandboxError> {
+        let session_id = session
+            .native_session_id
+            .as_ref()
+            .ok_or_else(|| SandboxError::InvalidRequest {
+                message: "missing Copilot session id".to_string(),
+            })?;
+
+        // Build the session.send JSON-RPC request
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 100,  // Request ID for follow-up messages
+            "method": "session.send",
+            "params": {
+                "sessionId": session_id,
+                "prompt": prompt
+            }
+        });
+
+        let json = serde_json::to_string(&request).map_err(|e| SandboxError::StreamError {
+            message: format!("failed to serialize Copilot request: {}", e),
+        })?;
+
+        // Use LSP-style Content-Length framing for Copilot JSON-RPC
+        let message = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
+
+        sender.send(message).map_err(|_| SandboxError::StreamError {
+            message: "failed to send message to Copilot session".to_string(),
+        })?;
 
         Ok(())
     }
@@ -3933,12 +4052,13 @@ async fn reply_permission(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn all_agents() -> [AgentId; 5] {
+fn all_agents() -> [AgentId; 6] {
     [
         AgentId::Claude,
         AgentId::Codex,
         AgentId::Opencode,
         AgentId::Amp,
+        AgentId::Copilot,
         AgentId::Mock,
     ]
 }
@@ -3948,7 +4068,7 @@ fn all_agents() -> [AgentId; 5] {
 fn agent_supports_resume(agent: AgentId) -> bool {
     matches!(
         agent,
-        AgentId::Claude | AgentId::Amp | AgentId::Opencode | AgentId::Codex
+        AgentId::Claude | AgentId::Amp | AgentId::Opencode | AgentId::Codex | AgentId::Copilot
     )
 }
 
@@ -4040,6 +4160,26 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             item_started: false,
             shared_process: false, // per-turn subprocess with --continue
         },
+        AgentId::Copilot => AgentCapabilities {
+            plan_mode: true,           // /plan command support
+            permissions: true,         // callback-based permission handler
+            questions: true,           // ask_user tool
+            tool_calls: true,
+            tool_results: true,
+            text_messages: true,
+            images: true,              // vision model support
+            file_attachments: true,
+            session_lifecycle: true,   // session.start/resume/idle events
+            error_events: true,        // session.error events
+            reasoning: true,           // assistant.reasoning events
+            status: true,              // assistant.intent events
+            command_execution: true,   // bash tool
+            file_changes: true,        // edit/create tools
+            mcp_tools: true,           // native MCP support
+            streaming_deltas: true,    // assistant.message_delta events
+            item_started: true,        // tool.execution_start events
+            shared_process: true,      // server mode via JSON-RPC
+        },
         AgentId::Mock => AgentCapabilities {
             plan_mode: true,
             permissions: true,
@@ -4117,6 +4257,18 @@ fn agent_modes_for(agent: AgentId) -> Vec<AgentModeInfo> {
             name: "Build".to_string(),
             description: "Default build mode".to_string(),
         }],
+        AgentId::Copilot => vec![
+            AgentModeInfo {
+                id: "build".to_string(),
+                name: "Build".to_string(),
+                description: "Default build mode".to_string(),
+            },
+            AgentModeInfo {
+                id: "plan".to_string(),
+                name: "Plan".to_string(),
+                description: "Plan mode for exploration".to_string(),
+            },
+        ],
         AgentId::Mock => vec![
             AgentModeInfo {
                 id: "build".to_string(),
@@ -4154,6 +4306,14 @@ fn normalize_agent_mode(agent: AgentId, agent_mode: Option<&str>) -> Result<Stri
         },
         AgentId::Amp => match mode {
             "build" => Ok("build".to_string()),
+            value => Err(SandboxError::ModeNotSupported {
+                agent: agent.as_str().to_string(),
+                mode: value.to_string(),
+            }
+            .into()),
+        },
+        AgentId::Copilot => match mode {
+            "build" | "plan" => Ok(mode.to_string()),
             value => Err(SandboxError::ModeNotSupported {
                 agent: agent.as_str().to_string(),
                 mode: value.to_string(),
@@ -4217,6 +4377,7 @@ fn normalize_permission_mode(
         AgentId::Codex => matches!(mode, "default" | "plan" | "bypass"),
         AgentId::Amp => matches!(mode, "default" | "bypass"),
         AgentId::Opencode => matches!(mode, "default"),
+        AgentId::Copilot => matches!(mode, "default" | "plan" | "bypass"),
         AgentId::Mock => matches!(mode, "default" | "plan" | "bypass"),
     };
     if !supported {
@@ -4411,6 +4572,67 @@ fn read_lines<R: std::io::Read>(reader: R, sender: mpsc::UnboundedSender<String>
 fn write_lines(mut stdin: std::process::ChildStdin, mut receiver: mpsc::UnboundedReceiver<String>) {
     while let Some(line) = receiver.blocking_recv() {
         if writeln!(stdin, "{line}").is_err() {
+            break;
+        }
+        if stdin.flush().is_err() {
+            break;
+        }
+    }
+}
+
+/// Read JSON-RPC messages using LSP-style Content-Length header framing.
+/// Format: `Content-Length: N\r\n\r\n{json}`
+fn read_jsonrpc_messages<R: std::io::Read>(reader: R, sender: mpsc::UnboundedSender<String>) {
+    use std::io::Read;
+    let mut reader = BufReader::new(reader);
+    loop {
+        // Read headers until we find Content-Length
+        let mut content_length: Option<usize> = None;
+        loop {
+            let mut header = String::new();
+            match reader.read_line(&mut header) {
+                Ok(0) => return, // EOF
+                Ok(_) => {
+                    let trimmed = header.trim();
+                    if trimmed.is_empty() {
+                        // Empty line marks end of headers
+                        break;
+                    }
+                    if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+                        if let Ok(len) = value.trim().parse::<usize>() {
+                            content_length = Some(len);
+                        }
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+
+        // Read the JSON body
+        if let Some(len) = content_length {
+            let mut body = vec![0u8; len];
+            if reader.read_exact(&mut body).is_err() {
+                break;
+            }
+            if let Ok(json) = String::from_utf8(body) {
+                if sender.send(json).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Write JSON-RPC messages using LSP-style Content-Length header framing.
+/// Messages are already formatted with Content-Length headers.
+fn write_jsonrpc_messages(
+    mut stdin: std::process::ChildStdin,
+    mut receiver: mpsc::UnboundedReceiver<String>,
+) {
+    use std::io::Write;
+    while let Some(message) = receiver.blocking_recv() {
+        // Message already includes Content-Length header, write directly
+        if stdin.write_all(message.as_bytes()).is_err() {
             break;
         }
         if stdin.flush().is_err() {
@@ -4740,6 +4962,249 @@ impl CodexAppServerState {
     }
 }
 
+// Copilot Server State - JSON-RPC state machine for Copilot CLI server mode
+struct CopilotServerState {
+    session_id: Option<String>,
+    init_done: bool,
+    session_created: bool,
+    message_sent: bool,
+    next_id: i64,
+    prompt: String,
+    model: Option<String>,
+    cwd: Option<String>,
+    sender: Option<mpsc::UnboundedSender<String>>,
+}
+
+struct CopilotLineOutcome {
+    conversions: Vec<EventConversion>,
+    should_terminate: bool,
+}
+
+impl Default for CopilotLineOutcome {
+    fn default() -> Self {
+        Self {
+            conversions: Vec::new(),
+            should_terminate: false,
+        }
+    }
+}
+
+impl CopilotServerState {
+    fn new(options: SpawnOptions) -> Self {
+        let cwd = options
+            .working_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string());
+        Self {
+            session_id: options.session_id.clone(),
+            init_done: false,
+            session_created: false,
+            message_sent: false,
+            next_id: 1,
+            prompt: options.prompt.clone(),
+            model: options.model.clone(),
+            cwd,
+            sender: None,
+        }
+    }
+
+    fn start(&mut self, sender: &mpsc::UnboundedSender<String>) {
+        self.sender = Some(sender.clone());
+        // For Copilot, we don't need an init handshake - go straight to session.create
+        self.send_session_create();
+    }
+
+    fn handle_line(&mut self, line: &str) -> CopilotLineOutcome {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return CopilotLineOutcome::default();
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(err) => {
+                return CopilotLineOutcome {
+                    conversions: vec![agent_unparsed(
+                        "copilot",
+                        &err.to_string(),
+                        Value::String(trimmed.to_string()),
+                    )],
+                    should_terminate: false,
+                };
+            }
+        };
+
+        // Check if this is a JSON-RPC response (has "id" and "result" or "error")
+        if value.get("id").is_some() {
+            return self.handle_response(&value);
+        }
+
+        // Check if this is a JSON-RPC notification (has "method" but no "id")
+        if value.get("method").is_some() {
+            return self.handle_notification(&value);
+        }
+
+        // Check if this is a Copilot session event (has "type")
+        if value.get("type").is_some() {
+            match convert_copilot::event_to_universal(&value) {
+                Ok(conversions) => {
+                    // Only terminate on actual session-ending events, not session.idle
+                    // session.idle just means turn is complete but session stays open for follow-ups
+                    let event_type = value.get("type").and_then(Value::as_str);
+                    let should_terminate = event_type == Some("session.error")
+                        || event_type == Some("session.shutdown");
+                    return CopilotLineOutcome {
+                        conversions,
+                        should_terminate,
+                    };
+                }
+                Err(err) => {
+                    return CopilotLineOutcome {
+                        conversions: vec![agent_unparsed("copilot", &err, value)],
+                        should_terminate: false,
+                    };
+                }
+            }
+        }
+
+        CopilotLineOutcome::default()
+    }
+
+    fn handle_response(&mut self, value: &Value) -> CopilotLineOutcome {
+        // Check for session.create response
+        if !self.session_created && value.get("result").is_some() {
+            if let Some(session_id) = value
+                .get("result")
+                .and_then(|r| r.get("sessionId"))
+                .and_then(Value::as_str)
+            {
+                self.session_id = Some(session_id.to_string());
+                self.session_created = true;
+                // Now send the message
+                self.send_session_message();
+                return CopilotLineOutcome::default();
+            }
+        }
+
+        // Check for error response
+        if let Some(error) = value.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("RPC error");
+            let code = error.get("code").and_then(Value::as_i64);
+            return CopilotLineOutcome {
+                conversions: vec![EventConversion::new(
+                    UniversalEventType::Error,
+                    UniversalEventData::Error(ErrorData {
+                        message: message.to_string(),
+                        code: code.map(|c| c.to_string()),
+                        details: Some(value.clone()),
+                    }),
+                )
+                .with_raw(Some(value.clone()))],
+                should_terminate: true,
+            };
+        }
+
+        CopilotLineOutcome::default()
+    }
+
+    fn handle_notification(&mut self, value: &Value) -> CopilotLineOutcome {
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+
+        // Session events come as notifications with method "session.event"
+        // Format: { "jsonrpc": "2.0", "method": "session.event", "params": { "event": {...}, "sessionId": "..." } }
+        if method == "session.event" {
+            if let Some(params) = value.get("params") {
+                // Extract the actual event from params.event
+                let event = params.get("event").unwrap_or(params);
+                match convert_copilot::event_to_universal(event) {
+                    Ok(conversions) => {
+                        // Only terminate on actual session-ending events, not session.idle
+                        // session.idle just means turn is complete but session stays open for follow-ups
+                        let event_type = event.get("type").and_then(Value::as_str);
+                        let should_terminate = event_type == Some("session.error")
+                            || event_type == Some("session.shutdown");
+                        return CopilotLineOutcome {
+                            conversions,
+                            should_terminate,
+                        };
+                    }
+                    Err(err) => {
+                        return CopilotLineOutcome {
+                            conversions: vec![agent_unparsed("copilot", &err, value.clone())],
+                            should_terminate: false,
+                        };
+                    }
+                }
+            }
+        }
+
+        CopilotLineOutcome::default()
+    }
+
+    fn send_session_create(&mut self) {
+        let request_id = self.next_request_id();
+        let mut params = serde_json::Map::new();
+        if let Some(cwd) = &self.cwd {
+            params.insert("cwd".to_string(), Value::String(cwd.clone()));
+        }
+        if let Some(model) = &self.model {
+            params.insert("model".to_string(), Value::String(model.clone()));
+        }
+        // Add permission mode
+        params.insert("permissionMode".to_string(), Value::String("bypass".to_string()));
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "session.create",
+            "params": params
+        });
+        self.send_json(&request);
+    }
+
+    fn send_session_message(&mut self) {
+        if self.message_sent {
+            return;
+        }
+        let Some(session_id) = self.session_id.clone() else {
+            return;
+        };
+        let request_id = self.next_request_id();
+        let prompt = self.prompt.clone();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "session.send",
+            "params": {
+                "sessionId": session_id,
+                "prompt": prompt
+            }
+        });
+        self.message_sent = true;
+        self.send_json(&request);
+    }
+
+    fn next_request_id(&mut self) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn send_json<T: Serialize>(&self, payload: &T) {
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        let Ok(json) = serde_json::to_string(payload) else {
+            return;
+        };
+        // Use LSP-style Content-Length framing for Copilot JSON-RPC
+        let message = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
+        let _ = sender.send(message);
+    }
+}
+
 fn codex_prompt_for_mode(prompt: &str, mode: Option<&str>) -> String {
     match mode {
         Some("plan") => format!("Make a plan before acting.\n\n{prompt}"),
@@ -5002,6 +5467,10 @@ fn parse_agent_line(agent: AgentId, line: &str, session_id: &str) -> Vec<EventCo
                 .unwrap_or_else(|err| vec![agent_unparsed("amp", &err, value)]),
             Err(err) => vec![agent_unparsed("amp", &err.to_string(), value)],
         },
+        AgentId::Copilot => {
+            convert_copilot::event_to_universal(&value)
+                .unwrap_or_else(|err| vec![agent_unparsed("copilot", &err, value)])
+        }
         AgentId::Mock => vec![agent_unparsed(
             "mock",
             "mock agent does not parse streaming output",
