@@ -41,7 +41,12 @@
 		"pages": [
 			{
 				"group": "Getting started",
-				"pages": ["quickstart", "building-chat-ui", "manage-sessions"]
+				"pages": [
+					"quickstart",
+					"building-chat-ui",
+					"manage-sessions",
+					"opencode-compatibility"
+				]
 			},
 			{
 				"group": "Deploy",
@@ -49,8 +54,9 @@
 					"deploy/index",
 					"deploy/local",
 					"deploy/e2b",
-					"deploy/vercel",
 					"deploy/daytona",
+					"deploy/vercel",
+					"deploy/cloudflare",
 					"deploy/docker"
 				]
 			},
@@ -64,14 +70,14 @@
 					"cli",
 					"inspector",
 					"session-transcript-schema",
-					"cors",
+					"gigacode",
 					{
 						"group": "AI",
 						"pages": ["ai/skill", "ai/llms-txt"]
 					},
 					{
 						"group": "Advanced",
-						"pages": ["telemetry"]
+						"pages": ["daemon", "cors", "telemetry"]
 					}
 				]
 			},

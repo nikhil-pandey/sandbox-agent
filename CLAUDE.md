@@ -54,6 +54,7 @@ Universal schema guidance:
 - `sandbox-agent api agents list` ↔ `GET /v1/agents`
 - `sandbox-agent api agents install` ↔ `POST /v1/agents/{agent}/install`
 - `sandbox-agent api agents modes` ↔ `GET /v1/agents/{agent}/modes`
+- `sandbox-agent api agents models` ↔ `GET /v1/agents/{agent}/models`
 - `sandbox-agent api sessions list` ↔ `GET /v1/sessions`
 - `sandbox-agent api sessions create` ↔ `POST /v1/sessions/{sessionId}`
 - `sandbox-agent api sessions send-message` ↔ `POST /v1/sessions/{sessionId}/messages`
@@ -65,9 +66,25 @@ Universal schema guidance:
 - `sandbox-agent api sessions reject-question` ↔ `POST /v1/sessions/{sessionId}/questions/{questionId}/reject`
 - `sandbox-agent api sessions reply-permission` ↔ `POST /v1/sessions/{sessionId}/permissions/{permissionId}/reply`
 
+## OpenCode CLI (Experimental)
+
+`sandbox-agent opencode` starts a sandbox-agent server and attaches an OpenCode session (uses `/opencode`).
+
 ## Post-Release Testing
 
 After cutting a release, verify the release works correctly. Run `/project:post-release-testing` to execute the testing agent.
+
+## OpenCode Compatibility Tests
+
+The OpenCode compatibility suite lives at `server/packages/sandbox-agent/tests/opencode-compat` and validates the `@opencode-ai/sdk` against the `/opencode` API. Run it with:
+
+```bash
+SANDBOX_AGENT_SKIP_INSPECTOR=1 pnpm --filter @sandbox-agent/opencode-compat-tests test
+```
+
+## Naming
+
+- The product name is "Gigacode" (capital G, lowercase c). The CLI binary/package is `gigacode` (lowercase).
 
 ## Git Commits
 
