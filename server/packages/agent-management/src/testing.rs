@@ -63,6 +63,7 @@ pub fn test_agents_from_env() -> Result<Vec<TestAgentConfig>, TestAgentConfigErr
                     AgentId::Codex,
                     AgentId::Opencode,
                     AgentId::Amp,
+                    AgentId::Copilot,
                 ]);
                 continue;
             }

@@ -856,6 +856,7 @@ fn agent_display_name(agent: AgentId) -> &'static str {
         AgentId::Codex => "Codex",
         AgentId::Opencode => "OpenCode",
         AgentId::Amp => "Amp",
+        AgentId::Copilot => "Copilot CLI",
         AgentId::Mock => "Mock",
     }
 }

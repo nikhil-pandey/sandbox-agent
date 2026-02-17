@@ -69,6 +69,7 @@ url = "2.5"
 regress = "0.10"
 include_dir = "0.7"
 base64 = "0.22"
+github-copilot-sdk = { path = "../copilot-sdk/rust" }
 
 # Code generation (build deps)
 typify = "0.4"
